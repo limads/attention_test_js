@@ -1,0 +1,578 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>TARV</title>
+<style>
+  html,body { margin:0; width:100%; height:100%; overflow:hidden; background:#fff; font-family:Arial,sans-serif; }
+  canvas { display:block; width:100vw; height:100vh; touch-action:none; }
+  #error { position:fixed; left:10px; top:10px; z-index:10; color:#b00; background:#fff; display:none; white-space:pre-wrap; }
+</style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<div id="error"></div>
+<script>
+"use strict";
+
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+const errorBox = document.getElementById("error");
+
+let W = 0, H = 0;
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  W = window.innerWidth;
+  H = window.innerHeight;
+  canvas.width = Math.round(W*dpr);
+  canvas.height = Math.round(H*dpr);
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+}
+window.addEventListener("resize", resize);
+resize();
+
+function showError(e) {
+  console.error(e);
+  errorBox.style.display = "block";
+  errorBox.textContent = String(e?.stack || e);
+}
+
+/* ---------- Random / sampling ---------- */
+
+let SEED = 0;
+
+function random() {
+  if (SEED === 0) {
+    // Same idea as SystemTime::now().duration_since(UNIX_EPOCH)
+    SEED = Number(BigInt(Date.now()) * 1000000n & 0xffffffffffffffffn);
+    if (SEED === 0) SEED = 1;
+  }
+
+  // JavaScript numbers cannot exactly represent a u64. BigInt keeps the
+  // original LCG arithmetic exact.
+  let s = BigInt(Math.floor(SEED));
+  s = (s * 6364136223846793005n + 1442695040888963407n) &
+      0xffffffffffffffffn;
+  SEED = Number(s >> 11n); // enough state for subsequent calls
+  if (SEED === 0) SEED = 1;
+
+  return Number(s) / 18446744073709551616;
+}
+
+function chooseMultiple(a, amount) {
+  amount = Math.min(amount, a.length);
+  const indices = Array.from({length:a.length}, (_,i)=>i);
+  const result = [];
+  for (let i=0; i<amount; ++i) {
+    const j = i + Math.floor(random() * (a.length-i));
+    [indices[i],indices[j]] = [indices[j],indices[i]];
+    result.push(a[indices[i]]);
+  }
+  return result;
+}
+
+function shuffle(a) {
+  for (let i=a.length-1; i>=1; --i) {
+    const j = Math.floor(random()*(i+1));
+    [a[i],a[j]] = [a[j],a[i]];
+  }
+}
+
+/* ---------- Assets ---------- */
+
+const images = {};
+const imageFiles = {
+  trajTarget:"traj_target.png",
+  trajDistractor:"traj_distractor.png",
+  feedbackRightSmall:"feedback-correct-small.png",
+  feedbackWrongSmall:"feedback-incorrect-small.png",
+  target:"target.png",
+  distractor:"distractor.png",
+  feedbackCorrect:"feedback-correct.png",
+  feedbackIncorrect:"feedback-incorrect.png"
+};
+
+function loadImage(src) {
+  return new Promise((resolve,reject)=>{
+    const im = new Image();
+    im.onload=()=>resolve(im);
+    im.onerror=()=>reject(new Error("Não foi possível carregar "+src));
+    im.src=src;
+  });
+}
+
+const audioFiles = {
+  correctLeft:"wav1_220Hz_left.wav",
+  correctRight:"wav3_220Hz_right.wav",
+  incorrectLeft:"wav2_440Hz_left.wav",
+  incorrectRight:"wav4_440Hz_right.wav"
+};
+const audio = {};
+let audioCtx = null;
+
+async function loadAssets() {
+  for (const [k,v] of Object.entries(imageFiles)) images[k]=await loadImage(v);
+  for (const [k,v] of Object.entries(audioFiles)) {
+    const r=await fetch(v);
+    if (!r.ok) throw new Error("Não foi possível carregar "+v);
+    audio[k]=await r.arrayBuffer();
+  }
+}
+
+async function playSound(name) {
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  }
+  if (audioCtx.state === "suspended") await audioCtx.resume();
+  const buffer = await audioCtx.decodeAudioData(audio[name].slice(0));
+  const src = audioCtx.createBufferSource();
+  src.buffer=buffer;
+  src.connect(audioCtx.destination);
+  src.start();
+}
+
+/* ---------- Storage ---------- */
+
+function loadSessions() {
+  try { return JSON.parse(localStorage.getItem("sessions") || "[]"); }
+  catch (_) { return []; }
+}
+function saveSessions(sessions) {
+  localStorage.setItem("sessions", JSON.stringify(sessions));
+}
+
+/* ---------- Drawing / input ---------- */
+
+const pointer = {x:0,y:0,down:false};
+canvas.addEventListener("pointermove", e=>{
+  const r=canvas.getBoundingClientRect();
+  pointer.x=e.clientX-r.left; pointer.y=e.clientY-r.top;
+});
+canvas.addEventListener("pointerdown", e=>{
+  const r=canvas.getBoundingClientRect();
+  pointer.x=e.clientX-r.left; pointer.y=e.clientY-r.top;
+  pointer.down=true;
+  if (audioCtx && audioCtx.state==="suspended") audioCtx.resume();
+});
+canvas.addEventListener("pointerup", ()=>pointer.down=false);
+canvas.addEventListener("pointercancel", ()=>pointer.down=false);
+
+function clear(color="#fff") {
+  ctx.fillStyle=color;
+  ctx.fillRect(0,0,W,H);
+}
+function drawImage(im,x,y) { ctx.drawImage(im,x,y); }
+function inside(x,y,w,h) {
+  return pointer.down && pointer.x>=x && pointer.x<=x+w &&
+         pointer.y>=y && pointer.y<=y+h;
+}
+
+class TouchTexture {
+  constructor(up,down) {
+    this.up=up; this.down=down; this.x=0; this.y=0;
+    this.delay=5; this.remainingDown=0; this.visible=true;
+  }
+  setVisible(v){this.visible=v}
+  setPos(x,y){this.x=x;this.y=y}
+  setDelay(d){this.delay=d}
+  update() {
+    if(!this.visible) return false;
+    const pressed=inside(this.x,this.y,this.down.width,this.down.height);
+    if(pressed) {
+      drawImage(this.down,this.x,this.y);
+      this.remainingDown=this.delay;
+      return true;
+    }
+    if(this.remainingDown>0) {
+      --this.remainingDown;
+      drawImage(this.down,this.x,this.y);
+    } else drawImage(this.up,this.x,this.y);
+    return false;
+  }
+}
+
+function calculateSteps(start,end,speed) {
+  const dx=end[0]-start[0], dy=end[1]-start[1];
+  const distance=Math.hypot(dx,dy);
+  return [dx/distance*speed,dy/distance*speed,distance];
+}
+
+class Trajectory {
+  constructor(start,stop,isTarget,speed,target,dist) {
+    const [sx,sy,d]=calculateSteps(start,stop,speed);
+    const durationMs=Math.floor(d/(speed*(1000/60)));
+    this.stepX=sx; this.stepY=sy; this.isTarget=isTarget;
+    const im=isTarget?target:dist;
+    this.tex=new TouchTexture(im,im);
+    this.tex.x=start[0]; this.tex.y=start[1];
+    this.tex.setDelay(2);
+    this.distance=d; this.durationMs=durationMs; this.isClicked=false;
+  }
+  next() {
+    if(!this.tex.visible || this.isClicked) return;
+    const nx=this.tex.x+this.stepX, ny=this.tex.y+this.stepY;
+    if(nx>-this.tex.up.width && nx<W) {
+      this.tex.setVisible(true);
+      this.tex.setPos(nx,ny);
+      this.isClicked=this.tex.update();
+    } else this.tex.setVisible(false);
+  }
+}
+
+function generateTrajectories(n,maxTrajs,width,height,targetSize) {
+  const all=Array.from({length:maxTrajs},(_,i)=>i);
+  const chosen=chooseMultiple(all,n);
+  const heights=chosen.map(ix=>ix*targetSize);
+  const trajectories=[];
+  const directions=[];
+  for(let i=0;i<Math.floor(n/2);++i) directions.push(true);
+  for(let i=Math.floor(n/2);i<n;++i) directions.push(false);
+  for(const ltr of directions) {
+    const y=heights.pop();
+    trajectories.push(ltr ? [[0,y],[width,y]] : [[width,y],[0,y]]);
+  }
+  shuffle(trajectories);
+  return trajectories;
+}
+
+function minDistanceBetweenMovingObjects(a,b) {
+  const [[ax0,ay0],[ax1,ay1]]=a, [[bx0,by0],[bx1,by1]]=b;
+  const dax=ax1-ax0, day=ay1-ay0, dbx=bx1-bx0, dby=by1-by0;
+  const rx=ax0-bx0, ry=ay0-by0, vx=dax-dbx, vy=day-dby;
+  const ac=vx*vx+vy*vy;
+  const t=ac<1e-6?0:Math.max(0,Math.min(1,-(rx*vx+ry*vy)/ac));
+  return Math.hypot(rx+vx*t,ry+vy*t);
+}
+
+/* ---------- Data ---------- */
+
+const Outcome = {Correct:"Correct", Incorrect:"Incorrect", Miss:"Miss"};
+
+function accuracy(t) {
+  const total=t.num_targets+t.num_distractors;
+  return 1-(t.miss+t.com_err)/total;
+}
+
+function quantile(v,q) {
+  const pos=q*(v.length-1), i=Math.floor(pos), j=Math.ceil(pos);
+  if(i===j) return v[i];
+  return Math.round(v[i]+(pos-i)*(v[j]-v[i]));
+}
+function quantiles(values) {
+  if(!values.length) return [0,0,0];
+  const v=[...values].sort((a,b)=>a-b);
+  return [quantile(v,.50),quantile(v,.75),quantile(v,.90)];
+}
+function sessionName(isRt,id,vals) {
+  const [q50,q75,q90]=quantiles(vals);
+  return `${isRt?"TAFEB":"TARV"}_${id} Q50=${q50} Q75=${q75} Q90=${q90}`;
+}
+
+/* ---------- Trial loops ---------- */
+
+function wait(ms) {
+  return new Promise(resolve=>setTimeout(resolve,ms));
+}
+function frame() {
+  return new Promise(resolve=>requestAnimationFrame(resolve));
+}
+
+async function runTarvTrial(numTargets,numDistractors,maxObjs,speed,step) {
+  const target=images.trajTarget, dist=images.trajDistractor;
+  const pos=generateTrajectories(numTargets+numDistractors,maxObjs,W,H,target.height);
+  const trajs=[];
+  for(let i=0;i<numTargets;++i) {
+    const [start,stop]=pos.pop();
+    trajs.push(new Trajectory(start,stop,true,speed,target,dist));
+  }
+  for(let i=0;i<numDistractors;++i) {
+    const [start,stop]=pos.pop();
+    trajs.push(new Trajectory(start,stop,false,speed,target,dist));
+  }
+  shuffle(trajs);
+
+  const delays=trajs.map(()=>Math.floor(random()*500));
+  const shownFeedback=new Map();
+  const init=performance.now();
+  let duration=0;
+
+  while(true) {
+    const t=Math.floor(performance.now()-init);
+    const allClicked=trajs.every(x=>!x.tex.visible||x.isClicked);
+    const onlyDistractors=trajs.every(x=>x.isClicked||(!x.isTarget&&!x.isClicked));
+    if(allClicked||onlyDistractors) { duration=t; break; }
+
+    clear("#fff");
+    for(let i=0;i<trajs.length;++i) {
+      if(t<delays[i]) continue;
+      trajs[i].next();
+      if(trajs[i].isClicked) {
+        const count=shownFeedback.get(i);
+        if(count!==undefined && count<30) {
+          drawImage(trajs[i].isTarget?images.feedbackRightSmall:images.feedbackWrongSmall,
+                    trajs[i].tex.x,trajs[i].tex.y);
+          shownFeedback.set(i,count+1);
+        } else if(count===undefined) shownFeedback.set(i,0);
+      }
+    }
+    await frame();
+  }
+
+  let hit=0,miss=0,com_err=0;
+  for(const t of trajs) {
+    if(t.isTarget&&t.isClicked) ++hit;
+    else if(t.isTarget&&!t.isClicked) ++miss;
+    else if(!t.isTarget&&t.isClicked) ++com_err;
+  }
+  return {num_targets:numTargets,num_distractors:numDistractors,speed,step,hit,miss,com_err,duration};
+}
+
+const DURATION_SECS=10;
+const MIN_TONE_STIM_DURATION_MS=100;
+const MAX_TONE_STIM_DURATION_MS=2000;
+const WAIT_MS_BEFORE_TONE=2000;
+
+async function runRtTrial(showDuration,probCongruent,target,distractor,step) {
+  const isCorrectLeft=random()<.5;
+  const isHintCorrect=random()<probCongruent;
+  const cx=W/2;
+  const separation=cx*.5+random()*cx;
+  const halfSz=target.up.width/2;
+  const leftX=cx-separation/2-halfSz;
+  const rightX=cx+separation/2-halfSz;
+
+  target.x=isCorrectLeft?leftX:rightX;
+  distractor.x=isCorrectLeft?rightX:leftX;
+
+  clear("#fff"); await wait(WAIT_MS_BEFORE_TONE);
+
+  let tone;
+  if(isHintCorrect) tone=isCorrectLeft?"correctLeft":"correctRight";
+  else tone=isCorrectLeft?"incorrectLeft":"incorrectRight";
+  await playSound(tone);
+
+  const soundStart=performance.now();
+  while(performance.now()-soundStart<=showDuration) {
+    clear("#fff"); await frame();
+  }
+
+  const start=performance.now();
+  let trial;
+  while(true) {
+    clear("#fff");
+    const td=distractor.update();
+    const tt=target.update();
+    const elapsed=Math.floor(performance.now()-start);
+    let hit=null;
+    if(td&&!tt) hit=false;
+    else if(tt&&!td) hit=true;
+
+    if(hit!==null) {
+      trial={congruent:isHintCorrect,duration:showDuration,rt:elapsed,
+             outcome:hit?Outcome.Correct:Outcome.Incorrect,step};
+      break;
+    }
+    if(elapsed>=showDuration) {
+      trial={congruent:isHintCorrect,duration:showDuration,rt:showDuration,
+             outcome:Outcome.Miss,step};
+      break;
+    }
+    await frame();
+  }
+
+  const fbStart=performance.now();
+  while(performance.now()-fbStart<=MIN_TONE_STIM_DURATION_MS) {
+    clear("#fff");
+    drawImage(trial.outcome===Outcome.Correct?images.feedbackCorrect:images.feedbackIncorrect,
+              W*.75,H*.75);
+    await frame();
+  }
+  return trial;
+}
+
+async function runTarv(sessions,sessId) {
+  const target=images.trajTarget;
+  const maxTrajs=Math.floor(H/target.height);
+  const steps=[];
+  let nTrajs=6, speed=2;
+  const trajIncr=2, speedScaling=1.1;
+  const maxSteps=Math.floor((maxTrajs-nTrajs)/trajIncr);
+  for(let i=0;i<maxSteps;++i) {
+    steps.push({n_trajs:nTrajs,speed});
+    speed*=speedScaling; nTrajs+=trajIncr;
+  }
+  const session={name:"",trials:[],rt_trials:[],duration:0};
+  const start=performance.now();
+  let stepIx=0;
+
+  while(steps.length) {
+    const s=steps[stepIx];
+    const trial=await runTarvTrial(s.n_trajs/2,s.n_trajs/2,maxTrajs,s.speed,stepIx);
+    const acc=accuracy(trial);
+    if(acc>.9) { if(stepIx<steps.length-1) ++stepIx; }
+    else { if(stepIx>0) --stepIx; }
+    session.trials.push(trial);
+    const elapsed=Math.floor((performance.now()-start)/1000);
+    if(elapsed>=DURATION_SECS) { session.duration=elapsed; break; }
+  }
+  session.name=sessionName(false,sessId,session.trials.map(t=>t.step));
+  sessions.push(session);
+}
+
+async function runTafeb(sessions,sessId) {
+  const target=new TouchTexture(images.target,images.target);
+  const distractor=new TouchTexture(images.distractor,images.distractor);
+  const halfH=H/2, halfSz=target.up.height/2;
+  target.y=halfH-halfSz; distractor.y=halfH-halfSz;
+
+  const steps=[];
+  let showDuration=MAX_TONE_STIM_DURATION_MS, probCongruent=1;
+  const durationStep=10;
+  const nSteps=Math.floor((MAX_TONE_STIM_DURATION_MS-MIN_TONE_STIM_DURATION_MS)/durationStep);
+  const probStep=.5/nSteps;
+  for(let i=0;i<nSteps;++i) {
+    steps.push({show_duration:showDuration,prob_congruent:probCongruent});
+    showDuration-=durationStep; probCongruent-=probStep;
+  }
+
+  const session={name:"",trials:[],rt_trials:[],duration:0};
+  const start=performance.now();
+  let stepIx=0;
+  while(true) {
+    const s=steps[stepIx];
+    const trial=await runRtTrial(s.show_duration,s.prob_congruent,target,distractor,stepIx);
+    if(trial.outcome===Outcome.Correct) { if(stepIx<steps.length-1) ++stepIx; }
+    else { if(stepIx>0) --stepIx; }
+    session.rt_trials.push(trial);
+    const elapsed=Math.floor((performance.now()-start)/1000);
+    if(elapsed>=DURATION_SECS) { session.duration=elapsed; break; }
+  }
+  session.name=sessionName(true,sessId,session.rt_trials.map(t=>t.step));
+  sessions.push(session);
+}
+
+/* ---------- Session browser ---------- */
+
+let browserScreen="sessions", browserPage=0;
+
+function button(x,y,w,h,text) {
+  const hover=pointer.x>=x&&pointer.x<=x+w&&pointer.y>=y&&pointer.y<=y+h;
+  ctx.fillStyle=hover?"#ddd":"#eee";
+  ctx.strokeStyle="#888";
+  ctx.fillRect(x,y,w,h); ctx.strokeRect(x,y,w,h);
+  ctx.fillStyle="#111"; ctx.font="14px Arial";
+  ctx.fillText(text,x+8,y+h/2+5);
+  return hover&&pointer.down;
+}
+
+function drawBrowser(sessions) {
+  clear("#d3d3d3");
+  if(browserScreen==="sessions") return drawSessions(sessions);
+  return drawTrials(sessions,browserScreen.index);
+}
+
+function drawSessions(sessions) {
+  ctx.fillStyle="#111"; ctx.font="16px Arial"; ctx.fillText("Sessões",20,25);
+  const rowH=30, top=80, bottom=80;
+  const rows=Math.max(1,Math.floor((H-top-bottom)/rowH));
+  const start=browserPage*rows, end=Math.min(start+rows,sessions.length);
+  for(let i=start;i<end;++i) {
+    if(button(20,top+(i-start)*rowH,500,26,sessions[i].name)) {
+      browserScreen={index:i}; browserPage=0; pointer.down=false;
+    }
+  }
+  return drawNavigation(sessions.length,rows);
+}
+
+function drawTrials(sessions,index) {
+  const session=sessions[index];
+  ctx.fillStyle="#111"; ctx.font="16px Arial";
+  ctx.fillText(`Sessão: ${session.name}`,20,25);
+  const rowH=24, top=50, bottom=80;
+  const rows=Math.max(1,Math.floor((H-top-bottom)/rowH));
+  const list=session.trials.length?session.trials:session.rt_trials;
+  const start=browserPage*rows, end=Math.min(start+rows,list.length);
+
+  ctx.font="14px monospace";
+  if(session.trials.length) {
+    ctx.fillText("Targets  Distractors  Speed  Hit  Miss  ComErr",20,42);
+    for(let i=start;i<end;++i) {
+      const t=list[i], y=top+(i-start)*rowH;
+      ctx.fillText(
+        `${String(t.num_targets).padEnd(8)} ${String(t.num_distractors).padEnd(12)} `+
+        `${t.speed.toFixed(1).padEnd(6)} ${String(t.hit).padEnd(4)} `+
+        `${String(t.miss).padEnd(5)} ${String(t.com_err).padEnd(6)}`,20,y);
+    }
+  } else {
+    ctx.fillText("Congruent  Duration RT  Outcome",20,42);
+    for(let i=start;i<end;++i) {
+      const t=list[i], y=top+(i-start)*rowH;
+      ctx.fillText(`${String(t.congruent).padEnd(10)} ${String(t.duration).padEnd(8)} `+
+                   `${String(t.rt).padEnd(4)} ${t.outcome}`,20,y);
+    }
+  }
+
+  const totalPages=Math.max(1,Math.ceil(list.length/rows));
+  drawNavigation(list.length,rows,totalPages);
+
+  if(button(260,H-40,100,28,"Voltar")) {
+    browserScreen="sessions"; browserPage=0; pointer.down=false;
+  }
+}
+
+function drawNavigation(totalItems,rows,totalPages=Math.max(1,Math.ceil(totalItems/rows))) {
+  const y=H-100;
+  if(button(20,y,70,28,"Anterior") && browserPage>0) { --browserPage; pointer.down=false; }
+  if(button(100,y,70,28,"Próximo") && browserPage+1<totalPages) { ++browserPage; pointer.down=false; }
+  ctx.fillStyle="#111"; ctx.font="14px Arial";
+  ctx.fillText(`Página ${browserPage+1} / ${totalPages}`,20,y-8);
+
+  if(button(520,y,90,28,"Iniciar TARV")) return "tarv";
+  if(button(620,y,90,28,"Iniciar TAFEB")) return "tafeb";
+  if(button(720,y,100,28,"Salvar/sair")) return "quit";
+  return null;
+}
+
+/* ---------- Main loop ---------- */
+
+let sessions=loadSessions();
+let busy=false;
+
+async function main() {
+  try {
+    await loadAssets();
+    requestAnimationFrame(loop);
+  } catch(e) { showError(e); }
+}
+
+function loop() {
+  if(!busy) {
+    const action=drawBrowser(sessions);
+    if(action) {
+      pointer.down=false;
+      busy=true;
+      (async()=>{
+        try {
+          const n=sessions.length;
+          if(action==="tarv") await runTarv(sessions,n);
+          else if(action==="tafeb") await runTafeb(sessions,n);
+          else if(action==="quit") {
+            saveSessions(sessions);
+            busy=false;
+            return;
+          }
+          saveSessions(sessions);
+          browserScreen="sessions"; browserPage=0;
+        } catch(e) { showError(e); }
+        busy=false;
+      })();
+    }
+  }
+  requestAnimationFrame(loop);
+}
+
+main();
+</script>
+</body>
+</html>
