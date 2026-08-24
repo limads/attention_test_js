@@ -90,8 +90,7 @@ const imageFiles = {
   target:"target.png",
   distractor:"distractor.png",
   feedbackCorrect:"feedback-correct.png",
-  feedbackIncorrect:"feedback-incorrect.png",
-  questionMark:"question-mark.png"
+  feedbackIncorrect:"feedback-incorrect.png"
 };
 
 function loadImage(src) {
@@ -222,41 +221,17 @@ class Trajectory {
 }
 
 function generateTrajectories(n,maxTrajs,width,height,targetSize) {
-  // Each incremental step adds two stimuli.  The two new trajectories occupy
-  // two distinct randomly selected rows.  Each row contains a sequence of
-  // stimuli, but consecutive stimuli on the same row are spatially separated
-  // so that they never overlap.
-  const rowCount = Math.min(maxTrajs, Math.max(1, Math.floor(height/targetSize)));
-  const rowOrder = Array.from({length:rowCount}, (_,i)=>i);
-  shuffle(rowOrder);
-
-  const trajectories = [];
-  const pairCount = Math.ceil(n/2);
-
-  for(let p=0; p<pairCount; ++p) {
-    const rowA = rowOrder[(2*p) % rowCount];
-    const rowB = rowOrder[(2*p+1) % rowCount];
-
-    // Alternate direction to make the trajectories less predictable.
-    const leftToRightA = random() < 0.5;
-    const leftToRightB = random() < 0.5;
-
-    const yA = rowA * targetSize;
-    const yB = rowB * targetSize;
-
-    trajectories.push(
-      leftToRightA ? [[-targetSize,yA],[width,yA]]
-                   : [[width,yA],[-targetSize,yA]]
-    );
-
-    if(trajectories.length < n) {
-      trajectories.push(
-        leftToRightB ? [[-targetSize,yB],[width,yB]]
-                     : [[width,yB],[-targetSize,yB]]
-      );
-    }
+  const all=Array.from({length:maxTrajs},(_,i)=>i);
+  const chosen=chooseMultiple(all,n);
+  const heights=chosen.map(ix=>ix*targetSize);
+  const trajectories=[];
+  const directions=[];
+  for(let i=0;i<Math.floor(n/2);++i) directions.push(true);
+  for(let i=Math.floor(n/2);i<n;++i) directions.push(false);
+  for(const ltr of directions) {
+    const y=heights.pop();
+    trajectories.push(ltr ? [[0,y],[width,y]] : [[width,y],[0,y]]);
   }
-
   shuffle(trajectories);
   return trajectories;
 }
@@ -317,32 +292,16 @@ async function runTarvTrial(numTargets,numDistractors,maxObjs,speed,step) {
   }
   shuffle(trajs);
 
-  // Random delay between stimuli.  The first stimulus can start
-  // immediately; subsequent stimuli receive an independent random onset delay.
-  const delays = [];
-  let cumulativeDelay = 0;
-  for(let i=0; i<trajs.length; ++i) {
-    if(i === 0) {
-      delays.push(0);
-    } else {
-      cumulativeDelay += 100 + Math.floor(random()*201); // 100..300 ms
-      delays.push(cumulativeDelay);
-    }
-  }
-  shuffle(delays);
+  const delays=trajs.map(()=>Math.floor(random()*500));
   const shownFeedback=new Map();
   const init=performance.now();
   let duration=0;
 
   while(true) {
     const t=Math.floor(performance.now()-init);
-    const allFinished = trajs.every((x,i)=>
-      t >= delays[i] && (!x.tex.visible || x.isClicked)
-    );
-    const onlyDistractors = trajs.every((x,i)=>
-      t >= delays[i] && (x.isClicked || !x.isTarget)
-    );
-    if(allFinished || onlyDistractors) { duration=t; break; }
+    const allClicked=trajs.every(x=>!x.tex.visible||x.isClicked);
+    const onlyDistractors=trajs.every(x=>x.isClicked||(!x.isTarget&&!x.isClicked));
+    if(allClicked||onlyDistractors) { duration=t; break; }
 
     clear("#fff");
     for(let i=0;i<trajs.length;++i) {
@@ -378,7 +337,7 @@ async function runRtTrial(showDuration,probCongruent,target,distractor,step) {
   const isCorrectLeft=random()<.5;
   const isHintCorrect=random()<probCongruent;
   const cx=W/2;
-  const separation=cx*.5+random()*cx*.5;
+  const separation=cx*.5+random()*cx;
   const halfSz=target.up.width/2;
   const leftX=cx-separation/2-halfSz;
   const rightX=cx+separation/2-halfSz;
@@ -395,9 +354,7 @@ async function runRtTrial(showDuration,probCongruent,target,distractor,step) {
 
   const soundStart=performance.now();
   while(performance.now()-soundStart<=showDuration) {
-    clear("#fff"); 
-    drawImage(images.questionMark, (W-images.questionMark.width)/2, (H-images.questionMark.height)/2);
-    await frame();
+    clear("#fff"); await frame();
   }
 
   const start=performance.now();
@@ -427,10 +384,8 @@ async function runRtTrial(showDuration,probCongruent,target,distractor,step) {
   const fbStart=performance.now();
   while(performance.now()-fbStart<=MIN_TONE_STIM_DURATION_MS) {
     clear("#fff");
-    const feedback = trial.outcome===Outcome.Correct
-      ? images.feedbackCorrect
-      : images.feedbackIncorrect;
-    drawImage(feedback, (W-feedback.width)/2, (H-feedback.height)/2);
+    drawImage(trial.outcome===Outcome.Correct?images.feedbackCorrect:images.feedbackIncorrect,
+              W*.75,H*.75);
     await frame();
   }
   return trial;
@@ -438,15 +393,14 @@ async function runRtTrial(showDuration,probCongruent,target,distractor,step) {
 
 async function runTarv(sessions,sessId) {
   const target=images.trajTarget;
-  const maxTrajs=100;
+  const maxTrajs=Math.floor(H/target.height);
   const steps=[];
   let nTrajs=6, speed=2;
-  const trajIncr=2, speedScaling=1.05;
-  const maxSteps=Math.max(1, Math.floor((maxTrajs-nTrajs)/trajIncr)+1);
+  const trajIncr=2, speedScaling=1.2;
+  const maxSteps=Math.floor((maxTrajs-nTrajs)/trajIncr);
   for(let i=0;i<maxSteps;++i) {
-    steps.push({n_trajs:Math.min(nTrajs,maxTrajs),speed});
-    speed*=speedScaling;
-    nTrajs+=trajIncr;
+    steps.push({n_trajs:nTrajs,speed});
+    speed*=speedScaling; nTrajs+=trajIncr;
   }
   const session={name:"",trials:[],rt_trials:[],duration:0};
   const start=performance.now();
@@ -474,7 +428,7 @@ async function runTafeb(sessions,sessId) {
 
   const steps=[];
   let showDuration=MAX_TONE_STIM_DURATION_MS, probCongruent=1;
-  const durationStep=25;
+  const durationStep=50;
   const nSteps=Math.floor((MAX_TONE_STIM_DURATION_MS-MIN_TONE_STIM_DURATION_MS)/durationStep);
   const probStep=.5/nSteps;
   for(let i=0;i<nSteps;++i) {
@@ -542,21 +496,20 @@ function drawTrials(sessions,index) {
 
   ctx.font="14px monospace";
   if(session.trials.length) {
-    ctx.fillText("Step  Targets  Distractors  Speed  Hit  Miss  ComErr",20,42);
+    ctx.fillText("Targets  Distractors  Speed  Hit  Miss  ComErr",20,42);
     for(let i=start;i<end;++i) {
       const t=list[i], y=top+(i-start)*rowH;
       ctx.fillText(
-        `${String(t.step).padEnd(5)} ${String(t.num_targets).padEnd(8)} `+
-        `${String(t.num_distractors).padEnd(12)} ${t.speed.toFixed(1).padEnd(6)} `+
-        `${String(t.hit).padEnd(4)} ${String(t.miss).padEnd(5)} `+
-        `${String(t.com_err).padEnd(6)}`,20,y);
+        `${String(t.num_targets).padEnd(8)} ${String(t.num_distractors).padEnd(12)} `+
+        `${t.speed.toFixed(1).padEnd(6)} ${String(t.hit).padEnd(4)} `+
+        `${String(t.miss).padEnd(5)} ${String(t.com_err).padEnd(6)}`,20,y);
     }
   } else {
-    ctx.fillText("Step  Congruent  Duration RT  Outcome",20,42);
+    ctx.fillText("Congruent  Duration RT  Outcome",20,42);
     for(let i=start;i<end;++i) {
       const t=list[i], y=top+(i-start)*rowH;
-      ctx.fillText(`${String(t.step).padEnd(5)} ${String(t.congruent).padEnd(10)} `+
-                   `${String(t.duration).padEnd(8)} ${String(t.rt).padEnd(4)} ${t.outcome}`,20,y);
+      ctx.fillText(`${String(t.congruent).padEnd(10)} ${String(t.duration).padEnd(8)} `+
+                   `${String(t.rt).padEnd(4)} ${t.outcome}`,20,y);
     }
   }
 
