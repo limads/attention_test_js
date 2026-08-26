@@ -1,0 +1,7 @@
+{
+  "name": "Tarefa Experimental",
+  "short_name": "Tarefa",
+  "start_url": "./index.html",
+  "display": "fullscreen",
+  "orientation": "landscape"
+}
