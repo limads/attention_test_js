@@ -779,13 +779,8 @@ async function main() {
 function loop() {
   if(!busy) {
     const action=drawBrowser(sessions);
-
     if(action) {
-      // O toque que acionou o menu não pode ser carregado para a tarefa.
       pointer.down=false;
-      pointer.pressed=false;
-      pointer.responseTime=null;
-
       busy=true;
       (async()=>{
         try {
@@ -802,15 +797,10 @@ function loop() {
         } catch(e) { showError(e); }
         busy=false;
       })();
-    } else {
-      // No navegador de sessões, descarta toques que não acertaram nenhum botão.
-      // IMPORTANTE: isto só ocorre quando !busy. Durante TARV/TAFEB, o toque
-      // permanece disponível até ser consumido pela própria tarefa.
-      pointer.pressed=false;
-      pointer.responseTime=null;
     }
   }
 
+  pointer.pressed = false;
   requestAnimationFrame(loop);
 }
 
