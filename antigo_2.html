@@ -5,17 +5,8 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
 <title>TARV</title>
 <style>
-  html,body {
-    margin:0; width:100%; height:100%; overflow:hidden;
-    background:#fff; font-family:Arial,sans-serif;
-    touch-action:none; overscroll-behavior:none;
-    -webkit-user-select:none; user-select:none;
-    -webkit-touch-callout:none;
-  }
-  canvas {
-    display:block; width:100vw; height:100vh; touch-action:none;
-    -webkit-user-select:none; user-select:none;
-  }
+  html,body { margin:0; width:100%; height:100%; overflow:hidden; background:#fff; font-family:Arial,sans-serif; }
+  canvas { display:block; width:100vw; height:100vh; touch-action:none; }
   #error { position:fixed; left:10px; top:10px; z-index:10; color:#b00; background:#fff; display:none; white-space:pre-wrap; }
 </style>
 </head>
@@ -31,17 +22,14 @@ const errorBox = document.getElementById("error");
 
 let W = 0, H = 0;
 function resize() {
-  const dpr = Math.max(1, Math.min(window.devicePixelRatio || 1, 3));
-  W = document.documentElement.clientWidth || window.innerWidth;
-  H = document.documentElement.clientHeight || window.innerHeight;
+  const dpr = window.devicePixelRatio || 1;
+  W = window.innerWidth;
+  H = window.innerHeight;
   canvas.width = Math.round(W*dpr);
   canvas.height = Math.round(H*dpr);
-  canvas.style.width = W + "px";
-  canvas.style.height = H + "px";
   ctx.setTransform(dpr,0,0,dpr,0,0);
 }
 window.addEventListener("resize", resize);
-window.addEventListener("orientationchange", () => setTimeout(resize, 50));
 resize();
 
 function showError(e) {
@@ -133,20 +121,11 @@ async function loadAssets() {
   }
 }
 
-function initAudio() {
-  if (!audioCtx) {
-    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-    if (!AudioContextClass) {
-      throw new Error("Este navegador não oferece suporte a Web Audio.");
-    }
-    audioCtx = new AudioContextClass();
-  }
-  if (audioCtx.state === "suspended") return audioCtx.resume();
-  return Promise.resolve();
-}
-
 async function playSound(name) {
-  await initAudio();
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  }
+  if (audioCtx.state === "suspended") await audioCtx.resume();
   const buffer = await audioCtx.decodeAudioData(audio[name].slice(0));
   const src = audioCtx.createBufferSource();
   src.buffer=buffer;
@@ -166,91 +145,19 @@ function saveSessions(sessions) {
 
 /* ---------- Drawing / input ---------- */
 
-const pointer = {
-  x: 0,
-  y: 0,
-  down: false,
-  pressed: false,
-  responseTime: null
-};
-
-let activePointerId = null;
-
-function pointerPosition(e) {
-  const r = canvas.getBoundingClientRect();
-  pointer.x = e.clientX - r.left;
-  pointer.y = e.clientY - r.top;
-}
-
-function clearPointerResponse() {
-  pointer.pressed = false;
-  pointer.responseTime = null;
-}
-
-canvas.addEventListener("pointermove", e => {
-  if (activePointerId !== null && e.pointerId !== activePointerId) return;
-  pointerPosition(e);
+const pointer = {x:0,y:0,down:false};
+canvas.addEventListener("pointermove", e=>{
+  const r=canvas.getBoundingClientRect();
+  pointer.x=e.clientX-r.left; pointer.y=e.clientY-r.top;
 });
-
-canvas.addEventListener("pointerdown", e => {
-  e.preventDefault();
-  if (activePointerId !== null) return;
-
-  activePointerId = e.pointerId;
-  pointerPosition(e);
-  pointer.down = true;
-  pointer.pressed = true;
-  pointer.responseTime = performance.now();
-
-  try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
-
-  initAudio().catch(err => console.warn("Áudio:", err));
+canvas.addEventListener("pointerdown", e=>{
+  const r=canvas.getBoundingClientRect();
+  pointer.x=e.clientX-r.left; pointer.y=e.clientY-r.top;
+  pointer.down=true;
+  if (audioCtx && audioCtx.state==="suspended") audioCtx.resume();
 });
-
-canvas.addEventListener("pointerup", e => {
-  if (e.pointerId !== activePointerId) return;
-  e.preventDefault();
-  pointerPosition(e);
-  pointer.down = false;
-
-  try {
-    if (canvas.hasPointerCapture(e.pointerId)) canvas.releasePointerCapture(e.pointerId);
-  } catch (_) {}
-
-  activePointerId = null;
-});
-
-canvas.addEventListener("pointercancel", e => {
-  if (e.pointerId !== activePointerId) return;
-  pointer.down = false;
-  pointer.pressed = false;
-  pointer.responseTime = null;
-
-  try {
-    if (canvas.hasPointerCapture(e.pointerId)) canvas.releasePointerCapture(e.pointerId);
-  } catch (_) {}
-
-  activePointerId = null;
-});
-
-canvas.addEventListener("contextmenu", e => e.preventDefault());
-
-function consumePress(x,y,w,h,margin=0) {
-  if (!pointer.pressed) return false;
-  const hit =
-    pointer.x >= x-margin && pointer.x <= x+w+margin &&
-    pointer.y >= y-margin && pointer.y <= y+h+margin;
-  if (hit) {
-    pointer.pressed = false;
-    return true;
-  }
-  return false;
-}
-
-function isPointerInside(x,y,w,h) {
-  return pointer.x>=x && pointer.x<=x+w &&
-         pointer.y>=y && pointer.y<=y+h;
-}
+canvas.addEventListener("pointerup", ()=>pointer.down=false);
+canvas.addEventListener("pointercancel", ()=>pointer.down=false);
 
 function clear(color="#fff") {
   ctx.fillStyle=color;
@@ -272,24 +179,16 @@ class TouchTexture {
   setDelay(d){this.delay=d}
   update() {
     if(!this.visible) return false;
-
-    const inside = isPointerInside(
-      this.x, this.y, this.down.width, this.down.height
-    );
-
-    if (pointer.down && inside) {
+    const pressed=inside(this.x,this.y,this.down.width,this.down.height);
+    if(pressed) {
       drawImage(this.down,this.x,this.y);
-    } else if (this.remainingDown>0) {
-      --this.remainingDown;
-      drawImage(this.down,this.x,this.y);
-    } else {
-      drawImage(this.up,this.x,this.y);
-    }
-
-    if (consumePress(this.x,this.y,this.down.width,this.down.height)) {
       this.remainingDown=this.delay;
       return true;
     }
+    if(this.remainingDown>0) {
+      --this.remainingDown;
+      drawImage(this.down,this.x,this.y);
+    } else drawImage(this.up,this.x,this.y);
     return false;
   }
 }
@@ -487,11 +386,7 @@ async function runRtTrial(showDuration,probCongruent,target,distractor,step) {
   target.x=isCorrectLeft?leftX:rightX;
   distractor.x=isCorrectLeft?rightX:leftX;
 
-  clearPointerResponse();
-  pointer.down = false;
-
-  clear("#fff");
-  await wait(WAIT_MS_BEFORE_TONE);
+  clear("#fff"); await wait(WAIT_MS_BEFORE_TONE);
 
   let tone;
   if(isHintCorrect) tone=isCorrectLeft?"correctLeft":"correctRight";
@@ -500,15 +395,10 @@ async function runRtTrial(showDuration,probCongruent,target,distractor,step) {
 
   const soundStart=performance.now();
   while(performance.now()-soundStart<=showDuration) {
-    clear("#fff");
-    drawImage(images.questionMark,
-      (W-images.questionMark.width)/2,
-      (H-images.questionMark.height)/2);
+    clear("#fff"); 
+    drawImage(images.questionMark, (W-images.questionMark.width)/2, (H-images.questionMark.height)/2);
     await frame();
   }
-
-  clearPointerResponse();
-  pointer.down = false;
 
   const start=performance.now();
   let trial;
@@ -522,12 +412,8 @@ async function runRtTrial(showDuration,probCongruent,target,distractor,step) {
     else if(tt&&!td) hit=true;
 
     if(hit!==null) {
-      const rt = pointer.responseTime !== null
-        ? Math.max(0, Math.floor(pointer.responseTime - start))
-        : elapsed;
-      trial={congruent:isHintCorrect,duration:showDuration,rt,
+      trial={congruent:isHintCorrect,duration:showDuration,rt:elapsed,
              outcome:hit?Outcome.Correct:Outcome.Incorrect,step};
-      pointer.responseTime = null;
       break;
     }
     if(elapsed>=showDuration) {
@@ -617,23 +503,13 @@ async function runTafeb(sessions,sessId) {
 let browserScreen="sessions", browserPage=0;
 
 function button(x,y,w,h,text) {
-  const hover=isPointerInside(x,y,w,h);
-  const clicked=consumePress(x,y,w,h);
-
-  ctx.fillStyle=(hover && pointer.down)?"#ccc":"#eee";
+  const hover=pointer.x>=x&&pointer.x<=x+w&&pointer.y>=y&&pointer.y<=y+h;
+  ctx.fillStyle=hover?"#ddd":"#eee";
   ctx.strokeStyle="#888";
-  ctx.fillRect(x,y,w,h);
-  ctx.strokeRect(x,y,w,h);
-
-  ctx.fillStyle="#111";
-  ctx.font="14px Arial";
-  ctx.textAlign="center";
-  ctx.textBaseline="middle";
-  ctx.fillText(text,x+w/2,y+h/2);
-  ctx.textAlign="left";
-  ctx.textBaseline="alphabetic";
-
-  return clicked;
+  ctx.fillRect(x,y,w,h); ctx.strokeRect(x,y,w,h);
+  ctx.fillStyle="#111"; ctx.font="14px Arial";
+  ctx.fillText(text,x+8,y+h/2+5);
+  return hover&&pointer.down;
 }
 
 function drawBrowser(sessions) {
@@ -648,10 +524,8 @@ function drawSessions(sessions) {
   const rows=Math.max(1,Math.floor((H-top-bottom)/rowH));
   const start=browserPage*rows, end=Math.min(start+rows,sessions.length);
   for(let i=start;i<end;++i) {
-    const buttonW=Math.min(500, Math.max(200, W-40));
-    if(button(20,top+(i-start)*rowH,buttonW,26,sessions[i].name)) {
+    if(button(20,top+(i-start)*rowH,500,26,sessions[i].name)) {
       browserScreen={index:i}; browserPage=0; pointer.down=false;
-      clearPointerResponse();
     }
   }
   return drawNavigation(sessions.length,rows);
@@ -689,81 +563,24 @@ function drawTrials(sessions,index) {
   const totalPages=Math.max(1,Math.ceil(list.length/rows));
   drawNavigation(list.length,rows,totalPages);
 
-  const backW=100;
-  const backX=Math.max(20, W-backW-20);
-  if(button(backX,H-40,backW,28,"Voltar")) {
+  if(button(260,H-40,100,28,"Voltar")) {
     browserScreen="sessions"; browserPage=0; pointer.down=false;
-    clearPointerResponse();
   }
 }
 
 function drawNavigation(totalItems,rows,totalPages=Math.max(1,Math.ceil(totalItems/rows))) {
-  const margin=20;
-  const gap=10;
-  const buttonH=40;
+  const y=H-100;
+  if(button(20,y,70,28,"Anterior") && browserPage>0) { --browserPage; pointer.down=false; }
+  if(button(100,y,70,28,"Próximo") && browserPage+1<totalPages) { ++browserPage; pointer.down=false; }
+  ctx.fillStyle="#111"; ctx.font="14px Arial";
+  ctx.fillText(`Página ${browserPage+1} / ${totalPages}`,20,y-8);
 
-  ctx.fillStyle="#111";
-  ctx.font="14px Arial";
-  ctx.fillText(`Página ${browserPage+1} / ${totalPages}`,margin,H-102);
-
-  const buttons=[
-    {text:"Anterior", action:"prev", w:95},
-    {text:"Próximo", action:"next", w:95},
-    {text:"Iniciar TARV", action:"tarv", w:110},
-    {text:"Iniciar TAFEB", action:"tafeb", w:115},
-    {text:"Salvar/sair", action:"quit", w:110}
-  ];
-
-  const totalW=buttons.reduce((sum,b)=>sum+b.w,0)+gap*(buttons.length-1);
-
-  function drawButtonAt(b,x,y) {
-    if(!button(x,y,b.w,buttonH,b.text)) return null;
-    if(b.action==="prev") {
-      if(browserPage>0) --browserPage;
-      return null;
-    }
-    if(b.action==="next") {
-      if(browserPage+1<totalPages) ++browserPage;
-      return null;
-    }
-    return b.action;
-  }
-
-  if(W >= totalW + margin*2) {
-    let x=margin;
-    for(const b of buttons) {
-      const action=drawButtonAt(b,x,H-buttonH-20);
-      if(action) return action;
-      x += b.w + gap;
-    }
-  } else {
-    const first=[buttons[0],buttons[1]];
-    const second=buttons.slice(2);
-
-    const firstW=first.reduce((sum,b)=>sum+b.w,0)+gap;
-    let x=Math.max(margin,(W-firstW)/2);
-    for(const b of first) {
-      const action=drawButtonAt(b,x,H-94);
-      if(action) return action;
-      x += b.w + gap;
-    }
-
-    const secondW=second.reduce((sum,b)=>sum+b.w,0)+gap*(second.length-1);
-    x=Math.max(margin,(W-secondW)/2);
-    for(const b of second) {
-      const action=drawButtonAt(b,x,H-48);
-      if(action) return action;
-      x += b.w + gap;
-    }
-  }
-
-  if(browserPage>0) {
-    // A navegação é processada pelos botões acima; ações abaixo mantêm
-    // a lógica original, sem depender do estado "down".
-  }
-
+  if(button(520,y,90,28,"Iniciar TARV")) return "tarv";
+  if(button(620,y,90,28,"Iniciar TAFEB")) return "tafeb";
+  if(button(720,y,100,28,"Salvar/sair")) return "quit";
   return null;
 }
+
 /* ---------- Main loop ---------- */
 
 let sessions=loadSessions();
@@ -799,8 +616,6 @@ function loop() {
       })();
     }
   }
-
-  pointer.pressed = false;
   requestAnimationFrame(loop);
 }
 
